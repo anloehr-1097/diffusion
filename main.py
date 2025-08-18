@@ -4,22 +4,25 @@ from torch import Tensor
 
 class Diffusor:
 
-    def __init__(self, beta: float = 0.001, num_diff_steps: int = 100):
-        self.beta = beta  # must be small, i.e. 0.001
-        self.beta_schedule = torch.ones(num_diff_steps) * beta
+    def __init__(self, beta_max: float = 0.01, num_diff_steps: int = 100):
+        # self.beta = beta  # must be small, i.e. 0.001
+
+        self.beta_schedule: Tensor = torch.linspace(0.0005, beta_max, num_diff_steps)
+        self.alpha_schedule: Tensor = torch.ones(num_diff_steps) - self.beta_schedule
+
         self.diff_steps = num_diff_steps
 
-    def __call__(self, x: Tensor, steps: int = 100) -> float:
-        """
-        Apply the diffusor to the input value x.
-
-        :param x: The input value to be processed by the diffusor.
-        :return: The processed value after applying the diffusor.
-        """
-        for _ in range(steps):
-            x = self.step(x)
-
-        return x
+    # def __call__(self, x: Tensor, steps: int = 100) -> float:
+    #     """
+    #     Apply the diffusor to the input value x.
+    #
+    #     :param x: The input value to be processed by the diffusor.
+    #     :return: The processed value after applying the diffusor.
+    #     """
+    #     for _ in range(steps):
+    #         x = self.step(x)
+    #
+    #     return x
 
     def n_step(self, x: Tensor, num_steps: int = 100) -> Tensor:
         """
@@ -31,29 +34,29 @@ class Diffusor:
         """
         # stack batch_dim copies of beta_schedule
         #  to match the shape of x
-        alpha_schedule: Tensor = (
-            torch.ones(self.beta_schedule.shape) - self.beta_schedule
-        )
-        alpha_bar = torch.prod(alpha_schedule[:num_steps], dim=0)
-        mu_scale: torch.Tensor = torch.sqrt(alpha_bar).repeat(x.shape)
-        sigma_scale: torch.Tensor = 1 - alpha_bar.repeat(x.shape)
+        alpha_to_t = torch.prod(
+            self.alpha_schedule[:num_steps], dim=0
+        )  # \overline{alpha}_t}
+        mu_scale: torch.Tensor = torch.sqrt(alpha_to_t).repeat(x.shape)
+        sigma_scale: torch.Tensor = (1 - alpha_to_t).repeat(x.shape)
 
         # beta_vec: Tensor = torch.pow(self.beta * torch.ones(x.shape), num_steps)
         mean: Tensor = mu_scale * x
         sdev: Tensor = sigma_scale
-        return torch.normal(mean, sdev)
 
-    def step(self, x: Tensor) -> float:
-        """
-        Perform a single step of the diffusion process.
+        return mean + sdev * torch.randn_like(mean)
 
-        :param x: The input value to be processed in this step.
-        :return: The processed value after one step of diffusion.
-        """
-        beta_vec: Tensor = torch.ones(x.shape) * self.beta
-        mean: Tensor = torch.sqrt(torch.ones(beta_vec.shape) - beta_vec) * x
-        sdev: Tensor = torch.sqrt(beta_vec)
-        return torch.normal(mean, sdev)
+    # def step(self, x: Tensor) -> float:
+    #     """
+    #     Perform a single step of the diffusion process.
+    #
+    #     :param x: The input value to be processed in this step.
+    #     :return: The processed value after one step of diffusion.
+    #     """
+    #     beta_vec: Tensor = torch.ones(x.shape) * self.beta
+    #     mean: Tensor = torch.sqrt(torch.ones(beta_vec.shape) - beta_vec) * x
+    #     sdev: Tensor = torch.sqrt(beta_vec)
+    #     return torch.normal(mean, sdev)
 
 
 class MLP(torch.nn.Module):
@@ -64,6 +67,7 @@ class MLP(torch.nn.Module):
 
     def __init__(self, input_dim: int, time_dim, output_dim: int):
         super(MLP, self).__init__()
+        self.normalizer = torch.nn.LayerNorm(input_dim + 1)
         self.encoder = torch.nn.Linear(time_dim, 1)
         self.sigmoid = torch.nn.Sigmoid()
         self.fc1 = torch.nn.Linear(input_dim + 1, 128)
@@ -80,14 +84,16 @@ class MLP(torch.nn.Module):
         :return: Output tensor after passing through the MLP.
         """
         # print(x.shape, time.shape)
+
         time_enc = self.sigmoid(self.encoder(time))
-        x = self.fc1(torch.cat([x, time_enc], dim=1))
+        x = self.normalizer(torch.cat([x, time_enc], dim=1))
+        x = self.fc1(x)
         x = self.relu(x)
         x = self.fc2(x)
         x = self.relu(x)
         x = self.fc3(x)
         # Ensure output is non-negative for sigma
-        x[:, 1] = torch.exp(x[:, 1])
+        # x[:, 1] = torch.exp(x[:, 1])
         return x
 
 
@@ -143,7 +149,7 @@ def main() -> None:
 
     time_dim: int = 100  # one-hot-encoding of time steps
     sample_dim: int = 1
-    output_dim: int = 2  # mu, sigma
+    output_dim: int = 1  # mu
 
     diffusor: Diffusor = Diffusor(0.99, time_dim)
     diff_mlp = MLP(input_dim=sample_dim, time_dim=time_dim, output_dim=output_dim)
@@ -189,7 +195,7 @@ def train(
     # sample a time step t uniformly
     diff_steps: int = diffusor.diff_steps
     beta_schedule: torch.Tensor = diffusor.beta_schedule
-    alpha_schedule: Tensor = torch.ones(beta_schedule.shape[0]) - beta_schedule
+    alpha_schedule: Tensor = diffusor.alpha_schedule
 
     losses = []
     for train_step in range(num_train_steps):
@@ -198,16 +204,16 @@ def train(
         batch_idcs: torch.Tensor = torch.randint(0, data_0.shape[0], (batch_size,))
         batch: torch.Tensor = data_0[batch_idcs]
         time_step: int = torch.randint(1, diff_steps - 1, size=(1,)).item()
-        data_t: Tensor = diffusor(batch, time_step)
+        data_t: Tensor = diffusor.n_step(batch, time_step)
         time_vec = torch.zeros((batch.shape[0], diff_steps))
 
         if time_step == 1:
             time_vec[:, 0] = 1.0
-            out = denoiser(data_t.unsqueeze(1), time_vec)
-            mu_out = out[:, 0]
-            sigma_out = out[:, 1]
+            mu_out = denoiser(data_t.unsqueeze(1), time_vec)
+            sigma_out = diffusor.beta_schedule[time_step].repeat(batch.shape[0], 1)
             likelihood = torch.distributions.Normal(mu_out, sigma_out).log_prob(batch)
             loss = -torch.mean(likelihood)
+            loss = -loss  # maximize likelihood
 
         else:
             time_vec[:, time_step] = 1.0
@@ -235,11 +241,13 @@ def train(
             out = denoiser(data_t.unsqueeze(1), time_vec)
 
             # The following slightly diverges from the source (struemke23)
-            p_mu = out[:, 0]  # mu_t
-            p_sigma = out[:, 1]  # sigma_t
+            p_mu = out
 
             optimizer.zero_grad()
-            loss = kl_div_different_normal(q_mu, p_mu, q_sigma, p_sigma).mean()
+            # loss = kl_div_different_normal(q_mu, p_mu, q_sigma, p_sigma).mean()
+            loss = kl_div_normal(q_mu, p_mu, q_sigma).mean()
+            # maximize loss
+            loss = -loss
 
         assert not loss.isnan(), "Loss is NaN"
         loss.backward()
