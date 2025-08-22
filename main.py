@@ -6,6 +6,9 @@ from PIL import Image
 import io
 
 
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
 class Diffusor:
 
     def __init__(self, beta_max: float = 0.05, num_diff_steps: int = 1000):
@@ -244,11 +247,12 @@ def train(
 
     loss_avg: float = 0.0
 
+    denoiser.to(device)
     for train_step in range(num_train_steps):
 
         # get batch and time step
         batch_idcs: torch.Tensor = torch.randint(0, data_0.shape[0], (batch_size,))
-        batch: torch.Tensor = data_0[batch_idcs]
+        batch: torch.Tensor = data_0[batch_idcs].to(device)
         time_step: int = torch.randint(1, diff_steps - 1, size=(1,)).item()
         data_t: Tensor = diffusor.n_step(batch, time_step)
         time_vec = torch.zeros((batch.shape[0], diff_steps))
@@ -301,8 +305,10 @@ def train(
             1 / (train_step + 1)
         ) * loss.item()
 
-        if abs(loss.item() / loss_avg) < 100:
+        if abs(loss.item() / loss_avg) < 10:
             tracker.log_metric("Loss", loss.item())
+        else:
+            tracker.log_metric("Loss", loss_avg)
 
         total_param_norm = 0.0
         for param in denoiser.parameters():
