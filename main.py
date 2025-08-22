@@ -4,10 +4,10 @@ from torch import Tensor
 
 class Diffusor:
 
-    def __init__(self, beta_max: float = 0.01, num_diff_steps: int = 100):
+    def __init__(self, beta_max: float = 0.05, num_diff_steps: int = 1000):
         # self.beta = beta  # must be small, i.e. 0.001
 
-        self.beta_schedule: Tensor = torch.linspace(0.0005, beta_max, num_diff_steps)
+        self.beta_schedule: Tensor = torch.linspace(10e-4, beta_max, num_diff_steps)
         self.alpha_schedule: Tensor = torch.ones(num_diff_steps) - self.beta_schedule
 
         self.diff_steps = num_diff_steps
@@ -67,9 +67,9 @@ class MLP(torch.nn.Module):
 
     def __init__(self, input_dim: int, time_dim, output_dim: int):
         super(MLP, self).__init__()
-        self.normalizer = torch.nn.LayerNorm(input_dim + 1)
+
         self.encoder = torch.nn.Linear(time_dim, 1)
-        self.sigmoid = torch.nn.Sigmoid()
+        self.tanh = torch.nn.Tanh()
         self.fc1 = torch.nn.Linear(input_dim + 1, 128)
         self.fc2 = torch.nn.Linear(128, 64)
         self.fc3 = torch.nn.Linear(64, output_dim)
@@ -85,10 +85,11 @@ class MLP(torch.nn.Module):
         """
         # print(x.shape, time.shape)
 
-        time_enc = self.sigmoid(self.encoder(time))
-        x = self.normalizer(torch.cat([x, time_enc], dim=1))
+        x = torch.nn.functional.normalize(x, dim=1)  # normalize input
+        time_enc = self.encoder(time)
+        x = torch.cat([x, time_enc], dim=1)
         x = self.fc1(x)
-        x = self.relu(x)
+        x = self.tanh(x)
         x = self.fc2(x)
         x = self.relu(x)
         x = self.fc3(x)
@@ -119,7 +120,9 @@ def kl_div_normal(mu1: Tensor, mu2: Tensor, sigma: Tensor) -> Tensor:
 
     Calc according to (27) in struemke23.
     """
-    return torch.sum(torch.square(mu1 - mu2)) * 1 / 2 * sigma
+
+    loss = torch.sum(torch.square(mu1 - mu2)) * 1 / 2 * sigma
+    return loss
 
 
 def kl_div_different_normal(
@@ -165,22 +168,32 @@ def gen_data() -> torch.Tensor:
     return samples
 
 
-def generate_samples(denoiser: MLP, num_samples: int) -> torch.Tensor:
+def generate_samples(
+    denoiser: MLP, num_samples: int, beta_schedule: Tensor, save_samples: bool = False
+) -> torch.Tensor:
     """Generate samples from the denoiser model."""
-    time_steps: int = (
-        denoiser.fc1.in_features - 1
-    )  # assuming input_dim = time_dim + sample_dim
+    time_steps: int = beta_schedule.shape[
+        0
+    ]  # number of time steps in the diffusion process
     noise: Tensor = torch.randn((num_samples,))  # +1 for sample_dim
+
+    if save_samples:
+        samples: list[Tensor] = []
+        samples.append(noise)
 
     for denoise_step in range(time_steps - 1, 0, -1):
         time_vec: Tensor = torch.zeros((num_samples, time_steps))
         time_vec[:, denoise_step] = 1.0
         noise_param = denoiser(noise.unsqueeze(1), time_vec)
+        print("Noise param shape and values:", end=" ")
+        print(noise_param.shape, noise_param)
         mu_out = noise_param[:, 0]
-        sigma_out = noise_param[:, 1]
+        sigma_out = beta_schedule[denoise_step]
         noise = mu_out + sigma_out * torch.randn_like(mu_out)
+        if save_samples:
+            samples.append(noise)
 
-    return noise
+    return noise if not save_samples else torch.stack(samples)
 
 
 def train(
@@ -206,19 +219,17 @@ def train(
         time_step: int = torch.randint(1, diff_steps - 1, size=(1,)).item()
         data_t: Tensor = diffusor.n_step(batch, time_step)
         time_vec = torch.zeros((batch.shape[0], diff_steps))
+        time_vec[:, 0] = 1.0
 
         if time_step == 1:
-            time_vec[:, 0] = 1.0
             mu_out = denoiser(data_t.unsqueeze(1), time_vec)
             sigma_out = diffusor.beta_schedule[time_step].repeat(batch.shape[0], 1)
             likelihood = torch.distributions.Normal(mu_out, sigma_out).log_prob(batch)
             loss = -torch.mean(likelihood)
-            loss = -loss  # maximize likelihood
+            # loss = -loss  # maximize negative log likelihood
 
         else:
-            time_vec[:, time_step] = 1.0
             # t is in the middle of the diffusion process --> consistency loss
-            data_t = diffusor.n_step(batch, num_steps=time_step)
 
             # parameters of q(x_{t-1} | x_t, x_0)
             q_mu = (
@@ -246,11 +257,15 @@ def train(
             optimizer.zero_grad()
             # loss = kl_div_different_normal(q_mu, p_mu, q_sigma, p_sigma).mean()
             loss = kl_div_normal(q_mu, p_mu, q_sigma).mean()
+
             # maximize loss
-            loss = -loss
+            # loss = -loss
 
         assert not loss.isnan(), "Loss is NaN"
         loss.backward()
+
+        torch.nn.utils.clip_grad_norm_(denoiser.parameters(), max_norm=1.0)
+
         losses.append(loss.item())
         optimizer.step()
     return losses
