@@ -1,6 +1,9 @@
 import torch
 from torch import Tensor
+import matplotlib.pyplot as plt
 from dvclive import Live
+from PIL import Image
+import io
 
 
 class Diffusor:
@@ -149,15 +152,37 @@ def main() -> None:
     diff_mlp = MLP(input_dim=sample_dim, time_dim=time_dim, output_dim=output_dim)
     optimizer: torch.optim.Optimizer = torch.optim.SGD(diff_mlp.parameters())
 
-    train(
+    data_0: torch.Tensor = gen_data()
+    data0_img = track_hist_as_image(data_0, "Data Distribution.png", tracker)
+
+    diff_mlp = train(
         diffusor,
         diff_mlp,
         optimizer,
         tracker=tracker,
-        data_0=gen_data(),
+        data_0=data_0,
         num_train_steps=100,
     )
+
+    # generate samples
+    num_samples: int = 1000
+    gen_samples: torch.Tensor = generate_samples(
+        diff_mlp, num_samples, diffusor.beta_schedule, save_samples=True
+    )
+    track_hist_as_image(gen_samples, "Generated Samples.png", tracker)
+
     tracker.end()
+
+
+def track_hist_as_image(data: torch.Tensor, name: str, tracker: Live):
+    plt.hist(data.detach().numpy(), bins=int(data.shape[0] / 100), density=True)
+    buf = io.BytesIO()
+    plt.savefig(buf, format="png")
+    plt.close()
+    img = Image.open(buf)  # don't forget to close
+    tracker.log_image(name, img)
+    buf.close()
+    img.close()
 
 
 def gen_data() -> torch.Tensor:
@@ -172,6 +197,7 @@ def generate_samples(
     denoiser: MLP, num_samples: int, beta_schedule: Tensor, save_samples: bool = False
 ) -> torch.Tensor:
     """Generate samples from the denoiser model."""
+    denoiser.eval()
     time_steps: int = beta_schedule.shape[
         0
     ]  # number of time steps in the diffusion process
@@ -204,7 +230,7 @@ def train(
     tracker: Live,
     num_train_steps: int = 1000,
     batch_size: int = 64,
-):
+) -> MLP:
     """Training diffusor model."""
 
     tracker.log_param("Batch Size", batch_size)
@@ -216,7 +242,6 @@ def train(
     beta_schedule: torch.Tensor = diffusor.beta_schedule
     alpha_schedule: Tensor = diffusor.alpha_schedule
 
-    losses: list[float] = []
     loss_avg: float = 0.0
 
     for train_step in range(num_train_steps):
@@ -290,7 +315,7 @@ def train(
 
         tracker.next_step()
 
-    return losses
+    return denoiser
 
 
 if __name__ == "__main__":
