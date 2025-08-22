@@ -1,5 +1,6 @@
 import torch
 from torch import Tensor
+from dvclive import Live
 
 
 class Diffusor:
@@ -12,19 +13,7 @@ class Diffusor:
 
         self.diff_steps = num_diff_steps
 
-    # def __call__(self, x: Tensor, steps: int = 100) -> float:
-    #     """
-    #     Apply the diffusor to the input value x.
-    #
-    #     :param x: The input value to be processed by the diffusor.
-    #     :return: The processed value after applying the diffusor.
-    #     """
-    #     for _ in range(steps):
-    #         x = self.step(x)
-    #
-    #     return x
-
-    def n_step(self, x: Tensor, num_steps: int = 100) -> Tensor:
+    def n_step(self, x: Tensor, n: int = 100) -> Tensor:
         """
         Apply the diffusor to the input value x for a specified number of steps.
 
@@ -34,9 +23,7 @@ class Diffusor:
         """
         # stack batch_dim copies of beta_schedule
         #  to match the shape of x
-        alpha_to_t = torch.prod(
-            self.alpha_schedule[:num_steps], dim=0
-        )  # \overline{alpha}_t}
+        alpha_to_t = torch.prod(self.alpha_schedule[:n], dim=0)  # \overline{alpha}_t}
         mu_scale: torch.Tensor = torch.sqrt(alpha_to_t).repeat(x.shape)
         sigma_scale: torch.Tensor = (1 - alpha_to_t).repeat(x.shape)
 
@@ -150,14 +137,27 @@ def kl_div_different_normal(
 
 def main() -> None:
 
-    time_dim: int = 100  # one-hot-encoding of time steps
+    tracker: Live = Live(report="md", monitor_system=True)
+
+    time_dim: int = 1000  # one-hot-encoding of time steps
+    tracker.log_param("Diffusion Time Steps", time_dim)
+
     sample_dim: int = 1
     output_dim: int = 1  # mu
 
-    diffusor: Diffusor = Diffusor(0.99, time_dim)
+    diffusor: Diffusor = Diffusor()
     diff_mlp = MLP(input_dim=sample_dim, time_dim=time_dim, output_dim=output_dim)
     optimizer: torch.optim.Optimizer = torch.optim.SGD(diff_mlp.parameters())
-    train(diffusor, diff_mlp, optimizer, gen_data(), num_train_steps=1000)
+
+    train(
+        diffusor,
+        diff_mlp,
+        optimizer,
+        tracker=tracker,
+        data_0=gen_data(),
+        num_train_steps=100,
+    )
+    tracker.end()
 
 
 def gen_data() -> torch.Tensor:
@@ -201,16 +201,24 @@ def train(
     denoiser: MLP,
     optimizer: torch.optim.Optimizer,
     data_0: torch.Tensor,
+    tracker: Live,
     num_train_steps: int = 1000,
     batch_size: int = 64,
 ):
     """Training diffusor model."""
+
+    tracker.log_param("Batch Size", batch_size)
+    tracker.log_param("Num Training Steps", num_train_steps)
+    tracker.log_param("Dataset Size", data_0.shape[0])
+
     # sample a time step t uniformly
     diff_steps: int = diffusor.diff_steps
     beta_schedule: torch.Tensor = diffusor.beta_schedule
     alpha_schedule: Tensor = diffusor.alpha_schedule
 
-    losses = []
+    losses: list[float] = []
+    loss_avg: float = 0.0
+
     for train_step in range(num_train_steps):
 
         # get batch and time step
@@ -262,12 +270,26 @@ def train(
             # loss = -loss
 
         assert not loss.isnan(), "Loss is NaN"
+
         loss.backward()
-
         torch.nn.utils.clip_grad_norm_(denoiser.parameters(), max_norm=1.0)
-
-        losses.append(loss.item())
         optimizer.step()
+
+        loss_avg = (train_step / (train_step + 1)) * loss_avg + (
+            1 / (train_step + 1)
+        ) * loss.item()
+
+        if abs(loss.item() / loss_avg) < 100:
+            tracker.log_metric("Loss", loss.item())
+
+        total_param_norm = 0.0
+        for param in denoiser.parameters():
+            total_param_norm += param.norm().item()
+
+        tracker.log_metric("Total parameter norm", total_param_norm)
+
+        tracker.next_step()
+
     return losses
 
 
