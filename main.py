@@ -111,7 +111,7 @@ def kl_div_normal(mu1: Tensor, mu2: Tensor, sigma: Tensor) -> Tensor:
     Calc according to (27) in struemke23.
     """
 
-    loss = torch.sum(torch.square(mu1 - mu2)) * 1 / 2 * sigma
+    loss = torch.sum(torch.square(mu1 - mu2)) / (2 * torch.square(sigma))
     return loss
 
 
@@ -167,7 +167,7 @@ def main() -> None:
     # generate samples
     num_samples: int = 1000
     gen_samples: torch.Tensor = generate_samples(
-        diff_mlp, num_samples, diffusor.beta_schedule, save_samples=True
+        diff_mlp, num_samples, diffusor.beta_schedule, save_samples=False
     )
     track_hist_as_image(gen_samples, "Generated Samples.png", tracker)
 
@@ -211,8 +211,8 @@ def generate_samples(
         time_vec: Tensor = torch.zeros((num_samples, time_steps))
         time_vec[:, denoise_step] = 1.0
         noise_param = denoiser(noise.unsqueeze(1), time_vec)
-        print("Noise param shape and values:", end=" ")
-        print(noise_param.shape, noise_param)
+        # print("Noise param shape and values:", end=" ")
+        # print(noise_param.shape, noise_param)
         mu_out = noise_param[:, 0]
         sigma_out = beta_schedule[denoise_step]
         noise = mu_out + sigma_out * torch.randn_like(mu_out)
@@ -254,6 +254,7 @@ def train(
         time_vec = torch.zeros((batch.shape[0], diff_steps))
         time_vec[:, 0] = 1.0
 
+        optimizer.zero_grad()
         if time_step == 1:
             mu_out = denoiser(data_t.unsqueeze(1), time_vec)
             sigma_out = diffusor.beta_schedule[time_step].repeat(batch.shape[0], 1)
@@ -284,12 +285,8 @@ def train(
             # parameters for p(x_{t-1} | x_t)
             out = denoiser(data_t.unsqueeze(1), time_vec)
 
-            # The following slightly diverges from the source (struemke23)
-            p_mu = out
-
-            optimizer.zero_grad()
             # loss = kl_div_different_normal(q_mu, p_mu, q_sigma, p_sigma).mean()
-            loss = kl_div_normal(q_mu, p_mu, q_sigma).mean()
+            loss = kl_div_normal(q_mu, out, q_sigma).mean()
 
             # maximize loss
             # loss = -loss
