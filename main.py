@@ -135,7 +135,7 @@ def main() -> None:
     tracker: Live = Live(report="md", monitor_system=True)
 
     time_dim: int = 1000  # one-hot-encoding of time steps
-    learning_rate: float = 1e-4
+    learning_rate: float = 5e-4
     tracker.log_param("Diffusion Time Steps", time_dim)
     tracker.log_param("Learning Rate", learning_rate)
 
@@ -151,7 +151,7 @@ def main() -> None:
     )
 
     data_0: torch.Tensor = gen_data()
-    data0_img = track_hist_as_image(data_0, "Data Distribution.png", tracker)
+    track_hist_as_image(data_0, "Data Distribution.png", tracker)
 
     diff_mlp = train(
         diffusor,
@@ -159,7 +159,8 @@ def main() -> None:
         optimizer,
         tracker=tracker,
         data_0=data_0,
-        num_train_steps=500,
+        num_train_steps=2000,
+        batch_size=2048,
     )
 
     # generate samples
@@ -211,14 +212,11 @@ def generate_samples(
         time_vec: Tensor = torch.zeros((num_samples, time_steps))
         time_vec[:, denoise_step] = 1.0
         noise_param = denoiser(noise.unsqueeze(1), time_vec)
-        # print("Noise param shape and values:", end=" ")
-        # print(noise_param.shape, noise_param)
         mu_out = noise_param[:, 0]
         sigma_out = beta_schedule[denoise_step]
         noise = mu_out + sigma_out * torch.randn_like(mu_out)
         if save_samples:
             samples.append(noise)
-    print(noise.shape)
 
     return noise if not save_samples else torch.stack(samples)
 
@@ -296,7 +294,7 @@ def train(
             # loss = kl_div_different_normal(q_mu, p_mu, q_sigma, p_sigma).mean()
             loss = kl_div_normal(q_mu.to(device), out.to(device), q_sigma.to(device))
             print(
-                f"loss_approx: {torch.sum(torch.square(out - q_mu))}\n\
+                f"loss_approx: {torch.sum(torch.square(out - q_mu.to(device)))}\n\
                 p_mu: {torch.mean(out)},\n\
                 q_mu: {torch.mean(q_mu)},\n\
                 Sigma: {torch.mean(q_sigma)},\n\
