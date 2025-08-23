@@ -1,4 +1,5 @@
 import torch
+import numpy as np
 from torch import Tensor
 import matplotlib.pyplot as plt
 from dvclive import Live
@@ -62,6 +63,7 @@ class MLP(torch.nn.Module):
         super(MLP, self).__init__()
 
         self.encoder = torch.nn.Linear(time_dim, 1)
+        self.sigmoid = torch.nn.Sigmoid()
         self.tanh = torch.nn.Tanh()
         self.fc1 = torch.nn.Linear(input_dim + 1, 128)
         self.fc2 = torch.nn.Linear(128, 64)
@@ -78,8 +80,9 @@ class MLP(torch.nn.Module):
         """
         # print(x.shape, time.shape)
 
-        x = torch.nn.functional.normalize(x, dim=1)  # normalize input
-        time_enc = self.encoder(time)
+        # x = torch.nn.functional.normalize(x, dim=1)  # normalize input
+        x = x / torch.functional.norm(x, dim=1).unsqueeze(1)
+        time_enc = self.sigmoid(self.encoder(time))
         x = torch.cat([x, time_enc], dim=1)
         x = self.fc1(x)
         x = self.tanh(x)
@@ -91,20 +94,6 @@ class MLP(torch.nn.Module):
         return x
 
 
-def loss():
-    """Loss used for diffusion training.
-
-
-    Lower bound to negative log likelihood of the data.
-
-    Terms:
-        - reconstruction term = E_{q(x_1 | x_0)}[log p(x_0 | x_1)]
-        - (Prior matching) - disregarded as no parameter dependence
-        - consistency terms  = E_{q(x_t | x_0)}[D_KL(q(x_{t-1} x_t, x_0) || p(x_{t-1} | x_t))]
-    """
-    pass
-
-
 def kl_div_normal(mu1: Tensor, mu2: Tensor, sigma: Tensor) -> Tensor:
     """Calculate KL divergence between two normal distributions.
 
@@ -114,8 +103,8 @@ def kl_div_normal(mu1: Tensor, mu2: Tensor, sigma: Tensor) -> Tensor:
     Calc according to (27) in struemke23.
     """
 
-    loss = torch.sum(torch.square(mu1 - mu2)) / (2 * torch.square(sigma))
-    return loss
+    loss = torch.norm((mu1 - mu2), dim=1) / (2 * torch.square(sigma))
+    return loss.mean()
 
 
 def kl_div_different_normal(
@@ -155,6 +144,8 @@ def main() -> None:
 
     diffusor: Diffusor = Diffusor()
     diff_mlp = MLP(input_dim=sample_dim, time_dim=time_dim, output_dim=output_dim)
+    diff_mlp.apply(weights_init_uniform_rule)
+    print_model_summary(diff_mlp)
     optimizer: torch.optim.Optimizer = torch.optim.SGD(
         diff_mlp.parameters(), lr=learning_rate
     )
@@ -168,7 +159,7 @@ def main() -> None:
         optimizer,
         tracker=tracker,
         data_0=data_0,
-        num_train_steps=10,
+        num_train_steps=1000,
     )
 
     # generate samples
@@ -239,7 +230,7 @@ def train(
     data_0: torch.Tensor,
     tracker: Live,
     num_train_steps: int = 1000,
-    batch_size: int = 128,
+    batch_size: int = 512,
 ) -> MLP:
     """Training diffusor model."""
 
@@ -267,14 +258,17 @@ def train(
 
         optimizer.zero_grad()
         if time_step == 1:
+            print("L_0")
             mu_out = denoiser(data_t.unsqueeze(1).to(device), time_vec)
             sigma_out = diffusor.beta_schedule[time_step].repeat(batch.shape[0], 1)
             likelihood = torch.distributions.Normal(
                 mu_out, sigma_out.to(device)
             ).log_prob(batch.to(device))
+            print(f"Mu: {mu_out}, Sigma: {sigma_out}, likelihood: {likelihood}")
             loss = -torch.mean(likelihood)
 
         else:
+            print("L_t")
             # t is in the middle of the diffusion process --> consistency loss
 
             # parameters of q(x_{t-1} | x_t, x_0)
@@ -298,9 +292,10 @@ def train(
             out = denoiser(data_t.unsqueeze(1).to(device), time_vec)
 
             # loss = kl_div_different_normal(q_mu, p_mu, q_sigma, p_sigma).mean()
-            loss = kl_div_normal(
-                q_mu.to(device), out.to(device), q_sigma.to(device)
-            ).mean()
+            loss = kl_div_normal(q_mu.to(device), out.to(device), q_sigma.to(device))
+            print(
+                f"p_mu: {torch.mean(out)}, q_mu: {torch.mean(q_mu)}, Sigma: {torch.mean(q_sigma)}, Loss: {loss.item()}"
+            )
 
             # maximize loss
             # loss = -loss
@@ -308,7 +303,7 @@ def train(
         assert not loss.isnan(), "Loss is NaN"
 
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(denoiser.parameters(), max_norm=1.0)
+        # torch.nn.utils.clip_grad_norm_(denoiser.parameters(), max_norm=1.0)
         optimizer.step()
 
         loss_avg = (train_step / (train_step + 1)) * loss_avg + (
@@ -329,6 +324,30 @@ def train(
         tracker.next_step()
 
     return denoiser
+
+
+def print_model_summary(model: torch.nn.Module) -> None:
+    """Print a summary of the model's architecture."""
+    print("Model Summary:")
+    print(model)
+    print("\nModel Parameters:")
+    for name, param in model.named_parameters():
+        if param.requires_grad:
+            print(f"{name}: {param.shape}")
+        print(torch.mean(param))
+    print("\nTotal number of parameters:", sum(p.numel() for p in model.parameters()))
+    print(
+        "Trainable parameters:",
+        sum(p.numel() for p in model.parameters() if p.requires_grad),
+    )
+
+
+def weights_init_uniform_rule(m):
+    if isinstance(m, torch.nn.Linear):
+        n = m.in_features
+        y = 1.0 / np.sqrt(n)
+        torch.nn.init.uniform_(m.weight, -y, y)
+        torch.nn.init.constant_(m.bias, 0)
 
 
 if __name__ == "__main__":
