@@ -146,14 +146,18 @@ def main() -> None:
     tracker: Live = Live(report="md", monitor_system=True)
 
     time_dim: int = 1000  # one-hot-encoding of time steps
+    learning_rate: float = 1e-4
     tracker.log_param("Diffusion Time Steps", time_dim)
+    tracker.log_param("Learning Rate", learning_rate)
 
     sample_dim: int = 1
     output_dim: int = 1  # mu
 
     diffusor: Diffusor = Diffusor()
     diff_mlp = MLP(input_dim=sample_dim, time_dim=time_dim, output_dim=output_dim)
-    optimizer: torch.optim.Optimizer = torch.optim.SGD(diff_mlp.parameters())
+    optimizer: torch.optim.Optimizer = torch.optim.SGD(
+        diff_mlp.parameters(), lr=learning_rate
+    )
 
     data_0: torch.Tensor = gen_data()
     data0_img = track_hist_as_image(data_0, "Data Distribution.png", tracker)
