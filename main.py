@@ -81,7 +81,7 @@ class MLP(torch.nn.Module):
         # print(x.shape, time.shape)
 
         # x = torch.nn.functional.normalize(x, dim=1)  # normalize input
-        x = x / torch.functional.norm(x, dim=1).unsqueeze(1)
+        # x = x / torch.functional.norm(x, dim=1).unsqueeze(1)
         time_enc = self.sigmoid(self.encoder(time))
         x = torch.cat([x, time_enc], dim=1)
         x = self.fc1(x)
@@ -146,7 +146,7 @@ def main() -> None:
     diff_mlp = MLP(input_dim=sample_dim, time_dim=time_dim, output_dim=output_dim)
     diff_mlp.apply(weights_init_uniform_rule)
     print_model_summary(diff_mlp)
-    optimizer: torch.optim.Optimizer = torch.optim.SGD(
+    optimizer: torch.optim.Optimizer = torch.optim.Adam(
         diff_mlp.parameters(), lr=learning_rate
     )
 
@@ -159,7 +159,7 @@ def main() -> None:
         optimizer,
         tracker=tracker,
         data_0=data_0,
-        num_train_steps=1000,
+        num_train_steps=500,
     )
 
     # generate samples
@@ -174,7 +174,7 @@ def main() -> None:
 
 
 def track_hist_as_image(data: torch.Tensor, name: str, tracker: Live):
-    plt.hist(data.detach().numpy(), bins=int(data.shape[0] / 100), density=True)
+    plt.hist(data.detach().numpy(), bins=int(data.shape[0] / 10), density=True)
     buf = io.BytesIO()
     plt.savefig(buf, format="png")
     plt.close()
@@ -184,11 +184,11 @@ def track_hist_as_image(data: torch.Tensor, name: str, tracker: Live):
     img.close()
 
 
-def gen_data() -> torch.Tensor:
+def gen_data(len: int = 1000) -> torch.Tensor:
     """Bimodal normal distribution."""
     n1: torch.distributions.Distribution = torch.distributions.Normal(-5, 1)
     n2: torch.distributions.Distribution = torch.distributions.Normal(5, 0.5)
-    samples: torch.Tensor = torch.cat([n1.sample((10000,)), n2.sample((10000,))])
+    samples: torch.Tensor = torch.cat([n1.sample((len // 2,)), n2.sample((len // 2,))])
     return samples
 
 
@@ -230,7 +230,7 @@ def train(
     data_0: torch.Tensor,
     tracker: Live,
     num_train_steps: int = 1000,
-    batch_size: int = 512,
+    batch_size: int = 1024,
 ) -> MLP:
     """Training diffusor model."""
 
@@ -268,25 +268,27 @@ def train(
             loss = -torch.mean(likelihood)
 
         else:
-            print("L_t")
+            print(f"L_{time_step}")
             # t is in the middle of the diffusion process --> consistency loss
 
             # parameters of q(x_{t-1} | x_t, x_0)
-            q_mu = (
-                torch.sqrt(torch.prod(alpha_schedule[: time_step - 1]))
-                * beta_schedule[time_step]
-                * batch
-                / (1 - torch.prod(alpha_schedule[:time_step]))
-            ) + torch.sqrt(alpha_schedule[time_step]) * (
-                1 - torch.prod(alpha_schedule[: time_step - 1])
-            ) * data_t / (
-                1 - torch.prod(alpha_schedule[:time_step])
+            alpha_bar_t_minus_1: Tensor = torch.prod(alpha_schedule[: time_step - 1])
+            beta_t: Tensor = beta_schedule[time_step]
+            alpha_bar_t: Tensor = torch.prod(alpha_schedule[:time_step])
+
+            x_0_contrib: Tensor = (
+                (torch.sqrt(alpha_bar_t_minus_1) * beta_t) / (1 - alpha_bar_t) * batch
             )
-            q_sigma = (
-                (1 - torch.prod(alpha_schedule[: time_step - 1]))
-                * beta_schedule[time_step]
-                / (1 - torch.prod(alpha_schedule[:time_step]))
+            x_t_contrib: Tensor = (
+                torch.sqrt(alpha_bar_t)
+                * (1 - alpha_bar_t_minus_1)
+                / (1 - alpha_bar_t)
+                * data_t
             )
+
+            q_mu = x_0_contrib + x_t_contrib
+
+            q_sigma = beta_t * (1 - alpha_bar_t_minus_1) / (1 - alpha_bar_t)
 
             # parameters for p(x_{t-1} | x_t)
             out = denoiser(data_t.unsqueeze(1).to(device), time_vec)
@@ -294,16 +296,23 @@ def train(
             # loss = kl_div_different_normal(q_mu, p_mu, q_sigma, p_sigma).mean()
             loss = kl_div_normal(q_mu.to(device), out.to(device), q_sigma.to(device))
             print(
-                f"p_mu: {torch.mean(out)}, q_mu: {torch.mean(q_mu)}, Sigma: {torch.mean(q_sigma)}, Loss: {loss.item()}"
+                f"loss_approx: {torch.sum(torch.square(out - q_mu))}\n\
+                p_mu: {torch.mean(out)},\n\
+                q_mu: {torch.mean(q_mu)},\n\
+                Sigma: {torch.mean(q_sigma)},\n\
+                Loss: {loss.item()}\n"
             )
-
-            # maximize loss
-            # loss = -loss
 
         assert not loss.isnan(), "Loss is NaN"
 
         loss.backward()
-        # torch.nn.utils.clip_grad_norm_(denoiser.parameters(), max_norm=1.0)
+        # clip gradients to avoid exploding gradients
+        grad_norm: Tensor = torch.nn.utils.clip_grad_norm_(
+            denoiser.parameters(), max_norm=10.0
+        )
+
+        tracker.log_metric("Gradient norm", grad_norm.item())
+
         optimizer.step()
 
         loss_avg = (train_step / (train_step + 1)) * loss_avg + (
@@ -311,6 +320,7 @@ def train(
         ) * loss.item()
 
         if abs(loss.item() / loss_avg) < 10:
+
             tracker.log_metric("Loss", loss.item())
         else:
             tracker.log_metric("Loss", loss_avg)
