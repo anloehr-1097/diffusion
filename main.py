@@ -164,7 +164,7 @@ def main() -> None:
         optimizer,
         tracker=tracker,
         data_0=data_0,
-        num_train_steps=100,
+        num_train_steps=10,
     )
 
     # generate samples
@@ -172,6 +172,7 @@ def main() -> None:
     gen_samples: torch.Tensor = generate_samples(
         diff_mlp, num_samples, diffusor.beta_schedule, save_samples=False
     )
+    print("Generated smaples shape: ", gen_samples.shape)
     track_hist_as_image(gen_samples, "Generated Samples.png", tracker)
 
     tracker.end()
@@ -200,6 +201,7 @@ def generate_samples(
     denoiser: MLP, num_samples: int, beta_schedule: Tensor, save_samples: bool = False
 ) -> torch.Tensor:
     """Generate samples from the denoiser model."""
+    denoiser.to("cpu")
     denoiser.eval()
     time_steps: int = beta_schedule.shape[
         0
@@ -221,6 +223,7 @@ def generate_samples(
         noise = mu_out + sigma_out * torch.randn_like(mu_out)
         if save_samples:
             samples.append(noise)
+    print(noise.shape)
 
     return noise if not save_samples else torch.stack(samples)
 
@@ -232,7 +235,7 @@ def train(
     data_0: torch.Tensor,
     tracker: Live,
     num_train_steps: int = 1000,
-    batch_size: int = 64,
+    batch_size: int = 128,
 ) -> MLP:
     """Training diffusor model."""
 
@@ -252,19 +255,20 @@ def train(
 
         # get batch and time step
         batch_idcs: torch.Tensor = torch.randint(0, data_0.shape[0], (batch_size,))
-        batch: torch.Tensor = data_0[batch_idcs].to(device)
+        batch: torch.Tensor = data_0[batch_idcs]
         time_step: int = torch.randint(1, diff_steps - 1, size=(1,)).item()
         data_t: Tensor = diffusor.n_step(batch, time_step)
-        time_vec = torch.zeros((batch.shape[0], diff_steps))
+        time_vec = torch.zeros((batch.shape[0], diff_steps)).to(device)
         time_vec[:, 0] = 1.0
 
         optimizer.zero_grad()
         if time_step == 1:
-            mu_out = denoiser(data_t.unsqueeze(1), time_vec)
+            mu_out = denoiser(data_t.unsqueeze(1).to(device), time_vec)
             sigma_out = diffusor.beta_schedule[time_step].repeat(batch.shape[0], 1)
-            likelihood = torch.distributions.Normal(mu_out, sigma_out).log_prob(batch)
+            likelihood = torch.distributions.Normal(
+                mu_out, sigma_out.to(device)
+            ).log_prob(batch.to(device))
             loss = -torch.mean(likelihood)
-            # loss = -loss  # maximize negative log likelihood
 
         else:
             # t is in the middle of the diffusion process --> consistency loss
@@ -287,10 +291,12 @@ def train(
             )
 
             # parameters for p(x_{t-1} | x_t)
-            out = denoiser(data_t.unsqueeze(1), time_vec)
+            out = denoiser(data_t.unsqueeze(1).to(device), time_vec)
 
             # loss = kl_div_different_normal(q_mu, p_mu, q_sigma, p_sigma).mean()
-            loss = kl_div_normal(q_mu, out, q_sigma).mean()
+            loss = kl_div_normal(
+                q_mu.to(device), out.to(device), q_sigma.to(device)
+            ).mean()
 
             # maximize loss
             # loss = -loss
