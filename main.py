@@ -15,7 +15,7 @@ class Diffusor:
     def __init__(self, beta_max: float = 0.05, num_diff_steps: int = 1000):
         # self.beta = beta  # must be small, i.e. 0.001
 
-        self.beta_schedule: Tensor = torch.linspace(10e-4, beta_max, num_diff_steps)
+        self.beta_schedule: Tensor = torch.linspace(1e-4, beta_max, num_diff_steps)
         self.alpha_schedule: Tensor = torch.ones(num_diff_steps) - self.beta_schedule
 
         self.diff_steps = num_diff_steps
@@ -80,18 +80,31 @@ class MLP(torch.nn.Module):
         """
         # print(x.shape, time.shape)
 
-        # x = torch.nn.functional.normalize(x, dim=1)  # normalize input
-        # x = x / torch.functional.norm(x, dim=1).unsqueeze(1)
-        time_enc = self.sigmoid(self.encoder(time))
+        x = torch.nn.functional.normalize(x, dim=1)  # normalize input
+        time_enc = self.encoder(time)
         x = torch.cat([x, time_enc], dim=1)
         x = self.fc1(x)
         x = self.tanh(x)
         x = self.fc2(x)
-        x = self.relu(x)
+        x = self.tanh(x)
         x = self.fc3(x)
         # Ensure output is non-negative for sigma
         # x[:, 1] = torch.exp(x[:, 1])
         return x
+
+
+def loss():
+    """Loss used for diffusion training.
+
+
+    Lower bound to negative log likelihood of the data.
+
+    Terms:
+        - reconstruction term = E_{q(x_1 | x_0)}[log p(x_0 | x_1)]
+        - (Prior matching) - disregarded as no parameter dependence
+        - consistency terms  = E_{q(x_t | x_0)}[D_KL(q(x_{t-1} x_t, x_0) || p(x_{t-1} | x_t))]
+    """
+    pass
 
 
 def kl_div_normal(mu1: Tensor, mu2: Tensor, sigma: Tensor) -> Tensor:
@@ -103,8 +116,8 @@ def kl_div_normal(mu1: Tensor, mu2: Tensor, sigma: Tensor) -> Tensor:
     Calc according to (27) in struemke23.
     """
 
-    loss = torch.norm((mu1 - mu2), dim=1) / (2 * torch.square(sigma))
-    return loss.mean()
+    loss = torch.sum(torch.square(mu1 - mu2)) / (2 * torch.square(sigma))
+    return loss
 
 
 def kl_div_different_normal(
@@ -135,7 +148,7 @@ def main() -> None:
     tracker: Live = Live(report="md", monitor_system=True)
 
     time_dim: int = 1000  # one-hot-encoding of time steps
-    learning_rate: float = 5e-4
+    learning_rate: float = 1e-4
     tracker.log_param("Diffusion Time Steps", time_dim)
     tracker.log_param("Learning Rate", learning_rate)
 
@@ -144,14 +157,12 @@ def main() -> None:
 
     diffusor: Diffusor = Diffusor()
     diff_mlp = MLP(input_dim=sample_dim, time_dim=time_dim, output_dim=output_dim)
-    diff_mlp.apply(weights_init_uniform_rule)
-    print_model_summary(diff_mlp)
-    optimizer: torch.optim.Optimizer = torch.optim.Adam(
+    optimizer: torch.optim.Optimizer = torch.optim.SGD(
         diff_mlp.parameters(), lr=learning_rate
     )
 
     data_0: torch.Tensor = gen_data()
-    track_hist_as_image(data_0, "Data Distribution.png", tracker)
+    data0_img = track_hist_as_image(data_0, "Data Distribution.png", tracker)
 
     diff_mlp = train(
         diffusor,
@@ -175,7 +186,7 @@ def main() -> None:
 
 
 def track_hist_as_image(data: torch.Tensor, name: str, tracker: Live):
-    plt.hist(data.detach().numpy(), bins=int(data.shape[0] / 10), density=True)
+    plt.hist(data.detach().numpy(), bins=int(data.shape[0] / 100), density=True)
     buf = io.BytesIO()
     plt.savefig(buf, format="png")
     plt.close()
@@ -259,6 +270,7 @@ def train(
             print("L_0")
             mu_out = denoiser(data_t.unsqueeze(1).to(device), time_vec)
             sigma_out = diffusor.beta_schedule[time_step].repeat(batch.shape[0], 1)
+            # TODO can we differentiate this?
             likelihood = torch.distributions.Normal(
                 mu_out, sigma_out.to(device)
             ).log_prob(batch.to(device))
@@ -292,7 +304,10 @@ def train(
             out = denoiser(data_t.unsqueeze(1).to(device), time_vec)
 
             # loss = kl_div_different_normal(q_mu, p_mu, q_sigma, p_sigma).mean()
-            loss = kl_div_normal(q_mu.to(device), out.to(device), q_sigma.to(device))
+            loss = kl_div_normal(
+                q_mu.detach().to(device), out.to(device), q_sigma.detach().to(device)
+            ).mean()
+
             print(
                 f"loss_approx: {torch.sum(torch.square(out - q_mu.to(device)))}\n\
                 p_mu: {torch.mean(out)},\n\
@@ -300,6 +315,8 @@ def train(
                 Sigma: {torch.mean(q_sigma)},\n\
                 Loss: {loss.item()}\n"
             )
+            # maximize loss
+            # loss = -loss
 
         assert not loss.isnan(), "Loss is NaN"
 
