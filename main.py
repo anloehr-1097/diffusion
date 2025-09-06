@@ -6,51 +6,10 @@ from dvclive import Live
 from PIL import Image
 import io
 
+from diffusor import Diffusor
+from loss import kl_div_normal
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-
-class Diffusor:
-
-    def __init__(self, beta_max: float = 0.05, num_diff_steps: int = 1000):
-        # self.beta = beta  # must be small, i.e. 0.001
-
-        self.beta_schedule: Tensor = torch.linspace(1e-4, beta_max, num_diff_steps)
-        self.alpha_schedule: Tensor = torch.ones(num_diff_steps) - self.beta_schedule
-
-        self.diff_steps = num_diff_steps
-
-    def n_step(self, x: Tensor, n: int = 100) -> Tensor:
-        """
-        Apply the diffusor to the input value x for a specified number of steps.
-
-        :param x: The input value to be processed by the diffusor.
-        :param num_steps: The number of steps to apply the diffusor.
-        :return: The processed value after applying the diffusor for num_steps.
-        """
-        # stack batch_dim copies of beta_schedule
-        #  to match the shape of x
-        alpha_to_t = torch.prod(self.alpha_schedule[:n], dim=0)  # \overline{alpha}_t}
-        mu_scale: torch.Tensor = torch.sqrt(alpha_to_t).repeat(x.shape)
-        sigma_scale: torch.Tensor = (1 - alpha_to_t).repeat(x.shape)
-
-        # beta_vec: Tensor = torch.pow(self.beta * torch.ones(x.shape), num_steps)
-        mean: Tensor = mu_scale * x
-        sdev: Tensor = sigma_scale
-
-        return mean + sdev * torch.randn_like(mean)
-
-    # def step(self, x: Tensor) -> float:
-    #     """
-    #     Perform a single step of the diffusion process.
-    #
-    #     :param x: The input value to be processed in this step.
-    #     :return: The processed value after one step of diffusion.
-    #     """
-    #     beta_vec: Tensor = torch.ones(x.shape) * self.beta
-    #     mean: Tensor = torch.sqrt(torch.ones(beta_vec.shape) - beta_vec) * x
-    #     sdev: Tensor = torch.sqrt(beta_vec)
-    #     return torch.normal(mean, sdev)
 
 
 class MLP(torch.nn.Module):
@@ -69,8 +28,11 @@ class MLP(torch.nn.Module):
         self.fc2 = torch.nn.Linear(128, 64)
         self.fc3 = torch.nn.Linear(64, output_dim)
         self.relu = torch.nn.ReLU()
+        torch.nn.init.normal_(self.fc1.weight, std=1e-2)
+        torch.nn.init.normal_(self.fc2.weight, std=1e-2)
+        torch.nn.init.normal_(self.fc3.weight, std=1e-2)
 
-    def __call__(self, x: Tensor, time: Tensor) -> Tensor:
+    def forward(self, x: Tensor, time: Tensor) -> Tensor:
         """
         Forward pass through the MLP.
 
@@ -80,7 +42,6 @@ class MLP(torch.nn.Module):
         """
         # print(x.shape, time.shape)
 
-        x = torch.nn.functional.normalize(x, dim=1)  # normalize input
         time_enc = self.encoder(time)
         x = torch.cat([x, time_enc], dim=1)
         x = self.fc1(x)
@@ -93,62 +54,12 @@ class MLP(torch.nn.Module):
         return x
 
 
-def loss():
-    """Loss used for diffusion training.
-
-
-    Lower bound to negative log likelihood of the data.
-
-    Terms:
-        - reconstruction term = E_{q(x_1 | x_0)}[log p(x_0 | x_1)]
-        - (Prior matching) - disregarded as no parameter dependence
-        - consistency terms  = E_{q(x_t | x_0)}[D_KL(q(x_{t-1} x_t, x_0) || p(x_{t-1} | x_t))]
-    """
-    pass
-
-
-def kl_div_normal(mu1: Tensor, mu2: Tensor, sigma: Tensor) -> Tensor:
-    """Calculate KL divergence between two normal distributions.
-
-    Assume sigma is the same for both distributions and sigma is
-    s.t. variance = sigma^2 * I.
-
-    Calc according to (27) in struemke23.
-    """
-
-    loss = torch.sum(torch.square(mu1 - mu2)) / (2 * torch.square(sigma))
-    return loss
-
-
-def kl_div_different_normal(
-    mu1: Tensor, mu2: Tensor, sigma1: Tensor, sigma2: Tensor
-) -> Tensor:
-    """Calculate KL divergence between two normal distributions.
-
-    Assume sigma is the same for both distributions and sigma is
-    s.t. variance = sigma^2 * I.
-
-    Calc according to (27) in struemke23.
-    """
-    return (
-        1
-        / 2
-        * (
-            torch.log(sigma2 / sigma1)
-            - 1
-            + (sigma1 / sigma2)
-            + 1 / sigma2 * torch.sum(torch.square(mu1 - mu2))
-        )
-    )
-    # return torch.sum(torch.square(mu1 - mu2)) * 1 / 2 * sigma
-
-
 def main() -> None:
 
     tracker: Live = Live(report="md", monitor_system=True)
 
     time_dim: int = 1000  # one-hot-encoding of time steps
-    learning_rate: float = 1e-4
+    learning_rate: float = 1e-3
     tracker.log_param("Diffusion Time Steps", time_dim)
     tracker.log_param("Learning Rate", learning_rate)
 
@@ -157,8 +68,8 @@ def main() -> None:
 
     diffusor: Diffusor = Diffusor()
     diff_mlp = MLP(input_dim=sample_dim, time_dim=time_dim, output_dim=output_dim)
-    optimizer: torch.optim.Optimizer = torch.optim.SGD(
-        diff_mlp.parameters(), lr=learning_rate
+    optimizer: torch.optim.Optimizer = torch.optim.AdamW(
+        diff_mlp.parameters(), lr=learning_rate, weight_decay=1e-4
     )
 
     data_0: torch.Tensor = gen_data()
@@ -179,7 +90,7 @@ def main() -> None:
     gen_samples: torch.Tensor = generate_samples(
         diff_mlp, num_samples, diffusor.beta_schedule, save_samples=False
     )
-    print("Generated smaples shape: ", gen_samples.shape)
+    # print("Generated smaples shape: ", gen_samples.shape)
     track_hist_as_image(gen_samples, "Generated Samples.png", tracker)
 
     tracker.end()
@@ -196,14 +107,6 @@ def track_hist_as_image(data: torch.Tensor, name: str, tracker: Live):
     img.close()
 
 
-def gen_data(len: int = 1000) -> torch.Tensor:
-    """Bimodal normal distribution."""
-    n1: torch.distributions.Distribution = torch.distributions.Normal(-5, 1)
-    n2: torch.distributions.Distribution = torch.distributions.Normal(5, 0.5)
-    samples: torch.Tensor = torch.cat([n1.sample((len // 2,)), n2.sample((len // 2,))])
-    return samples
-
-
 def generate_samples(
     denoiser: MLP, num_samples: int, beta_schedule: Tensor, save_samples: bool = False
 ) -> torch.Tensor:
@@ -213,6 +116,7 @@ def generate_samples(
     time_steps: int = beta_schedule.shape[
         0
     ]  # number of time steps in the diffusion process
+    alpha_schedule: Tensor = torch.ones(time_steps) - beta_schedule
     noise: Tensor = torch.randn((num_samples,))  # +1 for sample_dim
 
     if save_samples:
@@ -224,7 +128,12 @@ def generate_samples(
         time_vec[:, denoise_step] = 1.0
         noise_param = denoiser(noise.unsqueeze(1), time_vec)
         mu_out = noise_param[:, 0]
-        sigma_out = beta_schedule[denoise_step]
+
+        # sigma_out = \tilde{\beta}_t
+        alpha_bar_t_minus_1: Tensor = torch.prod(alpha_schedule[: denoise_step - 1])
+        beta_t: Tensor = beta_schedule[denoise_step]
+        alpha_bar_t: Tensor = torch.prod(alpha_schedule[:denoise_step])
+        sigma_out = beta_t * (1 - alpha_bar_t_minus_1) / (1 - alpha_bar_t)
         noise = mu_out + sigma_out * torch.randn_like(mu_out)
         if save_samples:
             samples.append(noise)
@@ -263,22 +172,22 @@ def train(
         time_step: int = torch.randint(1, diff_steps - 1, size=(1,)).item()
         data_t: Tensor = diffusor.n_step(batch, time_step)
         time_vec = torch.zeros((batch.shape[0], diff_steps)).to(device)
-        time_vec[:, 0] = 1.0
+        time_vec[:, time_step] = 1.0
 
         optimizer.zero_grad()
         if time_step == 1:
-            print("L_0")
+            # print("L_0")
             mu_out = denoiser(data_t.unsqueeze(1).to(device), time_vec)
             sigma_out = diffusor.beta_schedule[time_step].repeat(batch.shape[0], 1)
             # TODO can we differentiate this?
             likelihood = torch.distributions.Normal(
                 mu_out, sigma_out.to(device)
             ).log_prob(batch.to(device))
-            print(f"Mu: {mu_out}, Sigma: {sigma_out}, likelihood: {likelihood}")
+            # print(f"Mu: {mu_out}, Sigma: {sigma_out}, likelihood: {likelihood}")
             loss = -torch.mean(likelihood)
 
         else:
-            print(f"L_{time_step}")
+            # print(f"L_{time_step}")
             # t is in the middle of the diffusion process --> consistency loss
 
             # parameters of q(x_{t-1} | x_t, x_0)
@@ -308,22 +217,22 @@ def train(
                 q_mu.detach().to(device), out.to(device), q_sigma.detach().to(device)
             ).mean()
 
-            print(
-                f"loss_approx: {torch.sum(torch.square(out - q_mu.to(device)))}\n\
-                p_mu: {torch.mean(out)},\n\
-                q_mu: {torch.mean(q_mu)},\n\
-                Sigma: {torch.mean(q_sigma)},\n\
-                Loss: {loss.item()}\n"
-            )
+            # print(
+            #     f"loss_approx: {torch.sum(torch.square(out - q_mu.to(device)))}\n\
+            #     p_mu: {torch.mean(out)},\n\
+            #     q_mu: {torch.mean(q_mu)},\n\
+            #     Sigma: {torch.mean(q_sigma)},\n\
+            #     Loss: {loss.item()}\n"
+            # )
             # maximize loss
             # loss = -loss
 
         assert not loss.isnan(), "Loss is NaN"
 
-        loss.backward()
         # clip gradients to avoid exploding gradients
+        loss.backward()
         grad_norm: Tensor = torch.nn.utils.clip_grad_norm_(
-            denoiser.parameters(), max_norm=10.0
+            denoiser.parameters(), max_norm=1.0
         )
 
         tracker.log_metric("Gradient norm", grad_norm.item())
