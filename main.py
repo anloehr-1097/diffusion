@@ -1,11 +1,10 @@
 import torch
 import numpy as np
 from torch import Tensor
-import matplotlib.pyplot as plt
 from dvclive import Live
-from PIL import Image
-import io
+from tracker import track_hist_as_image
 
+from data import gen_data
 from diffusor import Diffusor
 from loss import kl_div_normal
 
@@ -94,17 +93,6 @@ def main() -> None:
     track_hist_as_image(gen_samples, "Generated Samples.png", tracker)
 
     tracker.end()
-
-
-def track_hist_as_image(data: torch.Tensor, name: str, tracker: Live):
-    plt.hist(data.detach().numpy(), bins=int(data.shape[0] / 100), density=True)
-    buf = io.BytesIO()
-    plt.savefig(buf, format="png")
-    plt.close()
-    img = Image.open(buf)  # don't forget to close
-    tracker.log_image(name, img)
-    buf.close()
-    img.close()
 
 
 def generate_samples(
