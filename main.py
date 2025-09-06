@@ -96,37 +96,91 @@ def main() -> None:
 
 
 def generate_samples(
-    denoiser: MLP, num_samples: int, beta_schedule: Tensor, save_samples: bool = False
+    denoiser, num_samples: int, beta_schedule: Tensor, save_samples: bool = False
 ) -> torch.Tensor:
-    """Generate samples from the denoiser model."""
-    denoiser.to("cpu")
+    """Generate samples from an x₀-predicting denoiser model."""
+    device = next(denoiser.parameters()).device
     denoiser.eval()
-    time_steps: int = beta_schedule.shape[
-        0
-    ]  # number of time steps in the diffusion process
-    alpha_schedule: Tensor = torch.ones(time_steps) - beta_schedule
-    noise: Tensor = torch.randn((num_samples,))  # +1 for sample_dim
+
+    T = beta_schedule.shape[0]
+    alpha = 1.0 - beta_schedule
+    alpha_bar = torch.cumprod(alpha, dim=0)
+
+    # Start from pure Gaussian noise
+    x_t = torch.randn((num_samples, 1), device=device)
 
     if save_samples:
-        samples: list[Tensor] = []
-        samples.append(noise)
+        samples = [x_t.cpu()]
 
-    for denoise_step in range(time_steps - 1, 0, -1):
-        time_vec: Tensor = torch.zeros((num_samples, time_steps))
-        time_vec[:, denoise_step] = 1.0
-        noise_param = denoiser(noise.unsqueeze(1), time_vec)
-        mu_out = noise_param[:, 0]
+    for t in range(T - 1, 0, -1):
+        # One-hot timestep encoding
+        t_vec = torch.zeros((num_samples, T), device=device)
+        t_vec[:, t] = 1.0
 
-        # sigma_out = \tilde{\beta}_t
-        alpha_bar_t_minus_1: Tensor = torch.prod(alpha_schedule[: denoise_step - 1])
-        beta_t: Tensor = beta_schedule[denoise_step]
-        alpha_bar_t: Tensor = torch.prod(alpha_schedule[:denoise_step])
-        sigma_out = beta_t * (1 - alpha_bar_t_minus_1) / (1 - alpha_bar_t)
-        noise = mu_out + sigma_out * torch.randn_like(mu_out)
+        # Predict x0
+        x0_pred = denoiser(x_t, t_vec)
+
+        # Compute coefficients for mean
+        beta_t = beta_schedule[t]
+        alpha_t = alpha[t]
+        alpha_bar_t = alpha_bar[t]
+        alpha_bar_t_prev = (
+            alpha_bar[t - 1] if t > 0 else torch.tensor(1.0, device=device)
+        )
+
+        coef_x0 = (torch.sqrt(alpha_bar_t_prev) * beta_t) / (1 - alpha_bar_t)
+        coef_xt = (torch.sqrt(alpha_t) * (1 - alpha_bar_t_prev)) / (1 - alpha_bar_t)
+
+        mu = coef_x0 * x0_pred + coef_xt * x_t
+
+        # Variance term
+        sigma_t = torch.sqrt((1 - alpha_bar_t_prev) / (1 - alpha_bar_t) * beta_t)
+
+        # Sample
+        if t > 1:  # no noise at last step
+            x_t = mu + sigma_t * torch.randn_like(x_t)
+        else:
+            x_t = mu
+
         if save_samples:
-            samples.append(noise)
+            samples.append(x_t.detach().cpu())
 
-    return noise if not save_samples else torch.stack(samples)
+    return x_t if not save_samples else torch.stack(samples)
+
+
+# def generate_samples(
+#     denoiser: MLP, num_samples: int, beta_schedule: Tensor, save_samples: bool = False
+# ) -> torch.Tensor:
+#     """Generate samples from the denoiser model."""
+#     denoiser.to("cpu")
+#     denoiser.eval()
+#     time_steps: int = beta_schedule.shape[
+#         0
+#     ]  # number of time steps in the diffusion process
+#     alpha_schedule: Tensor = torch.ones(time_steps) - beta_schedule
+#     noise: Tensor = torch.randn((num_samples,))  # +1 for sample_dim
+#
+#     if save_samples:
+#         samples: list[Tensor] = []
+#         samples.append(noise)
+#
+#     for denoise_step in range(time_steps - 1, 0, -1):
+#         time_vec: Tensor = torch.zeros((num_samples, time_steps))
+#         time_vec[:, denoise_step] = 1.0
+#         noise_param = denoiser(noise.unsqueeze(1), time_vec)
+#         mu_out = noise_param[:, 0]
+#
+#         # sigma_out = \tilde{\beta}_t
+#         alpha_bar_t_minus_1: Tensor = torch.prod(alpha_schedule[: denoise_step - 1])
+#         beta_t: Tensor = beta_schedule[denoise_step]
+#         alpha_bar_t: Tensor = torch.prod(alpha_schedule[:denoise_step])
+#         sigma_out = beta_t * (1 - alpha_bar_t_minus_1) / (1 - alpha_bar_t)
+#         noise = mu_out + sigma_out * torch.randn_like(mu_out)
+#         if save_samples:
+#             samples.append(noise)
+#
+#     return noise if not save_samples else torch.stack(samples)
+#
 
 
 def train(
@@ -198,12 +252,21 @@ def train(
             q_sigma = beta_t * (1 - alpha_bar_t_minus_1) / (1 - alpha_bar_t)
 
             # parameters for p(x_{t-1} | x_t)
+            # out = the estimation of x_0 given x_t, t which influences mu of p
             out = denoiser(data_t.unsqueeze(1).to(device), time_vec)
 
             # loss = kl_div_different_normal(q_mu, p_mu, q_sigma, p_sigma).mean()
-            loss = kl_div_normal(
-                q_mu.detach().to(device), out.to(device), q_sigma.detach().to(device)
-            ).mean()
+            ls_factor = (alpha_bar_t_minus_1 * torch.square(beta_t)) / torch.square(
+                1 - alpha_bar_t
+            )
+            loss = (
+                ls_factor
+                * kl_div_normal(
+                    batch.to(),
+                    out.to(device),
+                    q_sigma.detach().to(device),
+                ).mean()
+            )
 
             # print(
             #     f"loss_approx: {torch.sum(torch.square(out - q_mu.to(device)))}\n\
